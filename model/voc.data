@@ -1,0 +1,6 @@
+classes= 70
+train  = data/voc/2019_train.txt
+valid  = data/voc/2009_val.txt
+names = voc.names
+backup = plate_0.01
+
