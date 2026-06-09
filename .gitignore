@@ -22,6 +22,7 @@
 *.dylib
 *.dll
 *.so.*
+*.v2
 
 
 # Fortran module files
