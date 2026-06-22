@@ -11,9 +11,7 @@ CONFIG += debug_and_release
 QMAKE_CXXFLAGS_RELEASE = $$QMAKE_CFLAGS_RELEASE_WITH_DEBUGINFO
 QMAKE_LFLAGS_RELEASE = $$QMAKE_LFLAGS_RELEASE_WITH_DEBUGINFO
 
-# You can make your code fail to compile if it uses deprecated APIs.
-# In order to do so, uncomment the following line.
-#DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
+# DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000
 include(./licenseplatedialog.pri)
 include(./testQT/gtest_dependency.pri)
 
@@ -21,43 +19,32 @@ SOURCES += \
     main.cpp \
 
 HEADERS += \
-    ui_licenseplatedialog.h \
-    yolo_v2_class.hpp
+    ui_licenseplatedialog.h
 
 FORMS += \
     licenseplatedialog.ui
 
+# Uses OpenCV 4.x (with the DNN module). Darknet / CUDA dependencies have been removed.
 win32: {
     CONFIG(debug, debug|release) {
         OPENCV_LIB = lib/opencv_world430d.lib
-        YOLOV3_LIB = yolov3Lib/Debug/yolo_cpp_dll.lib
     }
     CONFIG(release, debug|release) {
         OPENCV_LIB = lib/opencv_world430.lib
-        YOLOV3_LIB = yolov3Lib/yolo_cpp_dll.lib
- }
+    }
 
-    LIBS += $$PWD/OpenCV/$$OPENCV_LIB \
-                   $$PWD/$$YOLOV3_LIB \
-                   -L$$quote(C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.7/lib/x64) -lcublas -lcuda -lcudadevrt -lcudart -lcudart_static -lOpenCL
-
-
+    LIBS += $$PWD/OpenCV/$$OPENCV_LIB
     INCLUDEPATH += $$PWD/OpenCV/include
-
-   # debug { DESTDIR = opencv_world430d.dll }
-    #release { DESTDIR = opencv_world430.dll }
-
-   # opencvlibs.path = $$PWD/OpenCV/bin
-    #opencvlibs.files = $$QMAKE_LIBDIR_QT/$$DESTDIR
-    #opencvlibs.CONFIG = no_check_exist
-
-   INSTALLS += opencvlibs
 }
 
 macx {
-    LIBS += /Users/huangyaode/code/opencv/build_arm64/lib
+    LIBS += -L/opt/homebrew/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn -lopencv_highgui
+    INCLUDEPATH += /opt/homebrew/include/opencv4
+}
 
-    INCLUDEPATH += /opt/homebrew/Cellar/opencv/4.5.5_1/include/opencv4
+unix:!macx {
+    CONFIG += link_pkgconfig
+    PKGCONFIG += opencv4
 }
 
 # Default rules for deployment.

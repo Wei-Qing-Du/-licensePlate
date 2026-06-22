@@ -9,7 +9,7 @@
 #define payPage 1
 namespace fs = std::filesystem;
 
-// 料金設定: 1時間ごとに 30元、最低料金 30元(端数は切り上げ)
+// Fee policy: 30 per hour, minimum charge 30 (partial hours are rounded up)
 static const int FEE_PER_HOUR = 30;
 static const int FEE_MINIMUM  = 30;
 
@@ -66,10 +66,10 @@ licensePlateDialog::licensePlateDialog(QWidget *parent)
 
   connect(ui->m_btnOK, &QPushButton::clicked, this, &licensePlateDialog::OK2Pay);
 
-  // --- 入場 / 出場 切替 と 結果表示ラベルをコードで追加 ---
+  // --- Entry/Exit mode selector and result label, added in code ---
   _modeCombo = new QComboBox(ui->cameraPage);
-  _modeCombo->addItem(QStringLiteral("入場 (IN)"));
-  _modeCombo->addItem(QStringLiteral("出場 (OUT)"));
+  _modeCombo->addItem(QStringLiteral("Entry (IN)"));
+  _modeCombo->addItem(QStringLiteral("Exit (OUT)"));
   _modeCombo->setGeometry(120, 320, 200, 30);
   connect(_modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
           this, &licensePlateDialog::onModeChanged);
@@ -79,17 +79,28 @@ licensePlateDialog::licensePlateDialog(QWidget *parent)
   _infoLabel->setWordWrap(true);
   _infoLabel->setStyleSheet(QStringLiteral("font-size:14px; color:#1f2937;"));
 
-  // --- YOLO(Darknet) の初期化 ---
+  // --- YOLOv8 (OpenCV DNN + ONNX) initialization ---
   _cur_path = fs::current_path().u8string() + "/../licensePlate";
 
   if (fs::exists(_cur_path))
     {
-      _cfg = _cur_path + "/model/yolov2.cfg";
-      _weight = _cur_path + "/model/yolov3-tiny_140000.weights";
-      _labels = _cur_path + "/model/voc.names";
-      _detector = new Detector(_cfg, _weight);
+      _modelPath = _cur_path + "/model/best.onnx";
+      _labels    = _cur_path + "/model/classes.txt";
 
-      // クラス名は起動時に一度だけ読み込む
+      try
+        {
+          _net = cv::dnn::readNetFromONNX(_modelPath);
+          _net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+          _net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+          _netReady = !_net.empty();
+        }
+      catch (const cv::Exception& e)
+        {
+          qWarning() << "ONNX model load failed:" << e.what();
+          _netReady = false;
+        }
+
+      // Load class names once at startup
       std::ifstream labelfile(_labels);
       if (labelfile.is_open())
         {
@@ -98,14 +109,13 @@ licensePlateDialog::licensePlateDialog(QWidget *parent)
             {
               while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
                 line.pop_back();
-              _classnames.push_back(line);
+              if (!line.empty())
+                _classnames.push_back(line);
             }
         }
     }
-  else
-    _detector = nullptr;
 
-  // SQLite 接続を一度だけ用意する(OK2Pay で再利用)
+  // Open the SQLite connection once and reuse it in OK2Pay
   QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE");
   db.setDatabaseName(QDir::currentPath() + "/database/LICENSE.db");
   if (!db.open())
@@ -118,9 +128,9 @@ void licensePlateDialog::onModeChanged(int index)
 {
   _mode = (index == 1) ? Mode::Exit : Mode::Entry;
   if (_mode == Mode::Entry)
-    _infoLabel->setText(QStringLiteral("【入場モード】ナンバーを確認して [OK] を押すと入場を記録します。"));
+    _infoLabel->setText(QStringLiteral("[Entry mode] Verify the plate and press [OK] to record the entry."));
   else
-    _infoLabel->setText(QStringLiteral("【出場モード】ナンバーを確認して [OK] を押すと料金を計算します。"));
+    _infoLabel->setText(QStringLiteral("[Exit mode] Verify the plate and press [OK] to calculate the fee."));
 }
 
 void qimageToMat(const QImage& image, cv::OutputArray out)
@@ -213,10 +223,10 @@ void licensePlateDialog::PaymentBtnClicked()
 void licensePlateDialog::ProcessCapturedImage(int requestId, QImage img)
 {
   Q_UNUSED(requestId);
-  // カメラで撮影した実画像を OpenCV(BGR) に変換して使う
+  // Convert the captured camera frame to an OpenCV BGR Mat
   const QImage rgb = img.convertToFormat(QImage::Format_RGB888);
   cv::Mat tmp;
-  qimageToMat(rgb, tmp);                       // RGB の Mat
+  qimageToMat(rgb, tmp);                       // RGB Mat
   if (!tmp.empty())
     cv::cvtColor(tmp, _testImg, cv::COLOR_RGB2BGR);
 
@@ -263,78 +273,151 @@ cv::Scalar licensePlateDialog::obj_id_to_color(int obj_id)
   return color;
 }
 
-void licensePlateDialog::draw_boxes(cv::Mat mat_img, std::vector<bbox_t> result_vec, std::vector<std::string> obj_names,
-                                    int current_det_fps, int current_cap_fps)
+void licensePlateDialog::draw_boxes(cv::Mat& mat_img, const std::vector<Detection>& result_vec,
+                                    const std::vector<std::string>& obj_names)
 {
-  int const colors[6][3] = { { 1, 0, 1 }, { 0, 0, 1 }, { 0, 1, 1 }, { 0, 1, 0 }, { 1, 1, 0 }, { 1, 0, 0 } };
-//https://zhuanlan.zhihu.com/p/135380256
-  for (auto &i : result_vec)
+  for (const auto& d : result_vec)
     {
-      cv::Scalar color = obj_id_to_color(i.obj_id);
-      cv::rectangle(mat_img, cv::Rect(i.x, i.y, i.w, i.h), color, 2);
-      if (obj_names.size() > i.obj_id)
+      cv::Scalar color = obj_id_to_color(d.classId);
+      cv::rectangle(mat_img, d.box, color, 2);
+      if (d.classId >= 0 && d.classId < static_cast<int>(obj_names.size()))
         {
-          std::string obj_name = obj_names[i.obj_id];
-          if (i.track_id > 0)
-            obj_name += " - " + std::to_string(i.track_id);
-          cv::Size const text_size = getTextSize(obj_name, cv::FONT_HERSHEY_COMPLEX_SMALL, 1.2, 2, 0);
-          int max_width = (text_size.width > i.w + 2) ? text_size.width : (i.w + 2);
-          max_width = std::max(max_width, (int)i.w + 2);
-          //max_width = std::max(max_width, 283);
-          std::string coords_3d;
-          if (!std::isnan(i.z_3d))
-            {
-              std::stringstream ss;
-              ss << std::fixed << std::setprecision(2) << "x:" << i.x_3d << "m y:" << i.y_3d << "m z:" << i.z_3d << "m ";
-              coords_3d = ss.str();
-              cv::Size const text_size_3d = getTextSize(ss.str(), cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, 1, 0);
-              int const max_width_3d = (text_size_3d.width > i.w + 2) ? text_size_3d.width : (i.w + 2);
-              if (max_width_3d > max_width)
-                max_width = max_width_3d;
-            }
-          cv::rectangle(mat_img, cv::Point2f(std::max((int)i.x - 1, 0), std::max((int)i.y - 35, 0)),
-                        cv::Point2f(std::min((int)i.x + max_width, mat_img.cols - 1), std::min((int)i.y, mat_img.rows - 1)),
-                        color, cv::FILLED, 8, 0);
-          putText(mat_img, obj_name, cv::Point2f(i.x, i.y - 16), cv::FONT_HERSHEY_COMPLEX_SMALL, 1.2, cv::Scalar(0, 0, 0), 2);
-          if (!coords_3d.empty())
-            putText(mat_img, coords_3d, cv::Point2f(i.x, i.y - 1), cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 0, 0), 1);
+          std::string label = obj_names[d.classId];
+          cv::Size const text_size = cv::getTextSize(label, cv::FONT_HERSHEY_COMPLEX_SMALL, 1.2, 2, 0);
+          int max_width = std::max(text_size.width, d.box.width + 2);
+          cv::rectangle(mat_img,
+                        cv::Point(std::max(d.box.x - 1, 0), std::max(d.box.y - 35, 0)),
+                        cv::Point(std::min(d.box.x + max_width, mat_img.cols - 1),
+                                  std::min(d.box.y, mat_img.rows - 1)),
+                        color, cv::FILLED);
+          cv::putText(mat_img, label, cv::Point(d.box.x, d.box.y - 16),
+                      cv::FONT_HERSHEY_COMPLEX_SMALL, 1.2, cv::Scalar(0, 0, 0), 2);
         }
     }
 }
 
-// 検出枠を左から右へ並べ、車牌領域(class "plate")を除いた文字を連結する
-QString licensePlateDialog::platesFromBoxes(const std::vector<bbox_t>& boxes) const
+// YOLOv8 ONNX inference
+// Input: a BGR cv::Mat / Output: detections after NMS
+std::vector<Detection> licensePlateDialog::detect(const cv::Mat& image,
+                                                  float confThreshold,
+                                                  float nmsThreshold)
 {
-  std::vector<bbox_t> chars;
+  std::vector<Detection> detections;
+  if (!_netReady || image.empty())
+    return detections;
+
+  // Simple resize (no letterboxing); scale boxes back with per-axis ratios afterwards
+  cv::Mat blob;
+  cv::dnn::blobFromImage(image, blob, 1.0 / 255.0,
+                         cv::Size(_inputSize, _inputSize),
+                         cv::Scalar(), /*swapRB=*/true, /*crop=*/false);
+  _net.setInput(blob);
+
+  std::vector<cv::Mat> outs;
+  try
+    {
+      _net.forward(outs, _net.getUnconnectedOutLayersNames());
+    }
+  catch (const cv::Exception& e)
+    {
+      qWarning() << "DNN forward failed:" << e.what();
+      return detections;
+    }
+
+  if (outs.empty())
+    return detections;
+
+  // YOLOv8 ONNX output shape is [1, 4 + num_classes, 8400].
+  // Reshape to [4+nc, 8400], then transpose to [8400, 4+nc] for row-wise iteration.
+  cv::Mat out = outs[0];
+  if (out.dims == 3)
+    out = out.reshape(1, out.size[1]);   // [4+nc, 8400]
+  cv::Mat outT;
+  cv::transpose(out, outT);              // [8400, 4+nc]
+
+  const int rows = outT.rows;
+  const int dims = outT.cols;
+  const int numClasses = dims - 4;
+  if (numClasses <= 0)
+    return detections;
+
+  const float xScale = static_cast<float>(image.cols) / static_cast<float>(_inputSize);
+  const float yScale = static_cast<float>(image.rows) / static_cast<float>(_inputSize);
+
+  std::vector<int>      classIds;
+  std::vector<float>    confidences;
+  std::vector<cv::Rect> boxes;
+
+  for (int r = 0; r < rows; ++r)
+    {
+      const float* row = outT.ptr<float>(r);
+      const float* scores = row + 4;
+      cv::Mat scoreMat(1, numClasses, CV_32F, const_cast<float*>(scores));
+      cv::Point classIdPoint;
+      double maxScore = 0.0;
+      cv::minMaxLoc(scoreMat, nullptr, &maxScore, nullptr, &classIdPoint);
+      if (maxScore < confThreshold)
+        continue;
+
+      float cx = row[0], cy = row[1], w = row[2], h = row[3];
+      int left   = static_cast<int>((cx - w / 2.f) * xScale);
+      int top    = static_cast<int>((cy - h / 2.f) * yScale);
+      int width  = static_cast<int>(w * xScale);
+      int height = static_cast<int>(h * yScale);
+
+      classIds.push_back(classIdPoint.x);
+      confidences.push_back(static_cast<float>(maxScore));
+      boxes.emplace_back(left, top, width, height);
+    }
+
+  std::vector<int> keep;
+  cv::dnn::NMSBoxes(boxes, confidences, confThreshold, nmsThreshold, keep);
+
+  detections.reserve(keep.size());
+  for (int idx : keep)
+    {
+      Detection d;
+      d.classId    = classIds[idx];
+      d.confidence = confidences[idx];
+      d.box        = boxes[idx] & cv::Rect(0, 0, image.cols, image.rows);
+      detections.push_back(d);
+    }
+  return detections;
+}
+
+// Sort character boxes left-to-right, skip the whole-plate box, and concatenate the result
+QString licensePlateDialog::platesFromBoxes(const std::vector<Detection>& boxes) const
+{
+  std::vector<Detection> chars;
   for (const auto& b : boxes)
     {
-      if (b.obj_id >= _classnames.size())
+      if (b.classId < 0 || b.classId >= static_cast<int>(_classnames.size()))
         continue;
-      if (_classnames[b.obj_id] == "plate")  // ナンバープレートの枠自体は文字ではない
+      if (_classnames[b.classId] == "plate")
         continue;
       chars.push_back(b);
     }
 
   std::sort(chars.begin(), chars.end(),
-            [](const bbox_t& a, const bbox_t& b) { return a.x < b.x; });
+            [](const Detection& a, const Detection& b) { return a.box.x < b.box.x; });
 
   QString plate;
   for (const auto& b : chars)
-    plate += QString::fromLocal8Bit(_classnames[b.obj_id].c_str()); // 省略名(中国語)も考慮
+    plate += QString::fromLocal8Bit(_classnames[b.classId].c_str());
   return plate.toUpper();
 }
 
-// _testImg を YOLO 認識し、車牌文字列を求めて精算画面へ
+// Run YOLO on _testImg, build the plate string, and switch to the payment page
 void licensePlateDialog::runDetectionAndShow()
 {
-  if (_testImg.empty() || !_detector)
+  if (_testImg.empty() || !_netReady)
     {
-      QMessageBox::warning(this, QStringLiteral("認識エラー"),
-                           QStringLiteral("画像またはモデルが準備できていません。"));
+      QMessageBox::warning(this, QStringLiteral("Recognition error"),
+                           QStringLiteral("Image or model is not ready."));
       return;
     }
 
-  std::vector<bbox_t> boxes = _detector->detect(_testImg, 0.5f);
+  std::vector<Detection> boxes = detect(_testImg, 0.25f, 0.45f);
   draw_boxes(_testImg, boxes, _classnames);
 
   _resultStr = platesFromBoxes(boxes);
@@ -345,14 +428,14 @@ void licensePlateDialog::runDetectionAndShow()
 
 void licensePlateDialog::CaptureImage()
 {
-  // カメラが動いていれば実撮影(結果は ProcessCapturedImage に届く)
+  // If the camera is active, take a real shot (result arrives in ProcessCapturedImage)
   if (_camera && _camera->status() == QCamera::ActiveStatus)
     {
       _imageCapture->capture();
       return;
     }
 
-  // カメラが無い場合のデモ用フォールバック(テスト画像)
+  // Demo fallback (bundled test image) when no camera is available
   _testImg = cv::imread((QDir::currentPath() + "/googletest/TestLicense.jpg").toStdString());
   runDetectionAndShow();
 }
@@ -361,7 +444,7 @@ int licensePlateDialog::calcFee(qint64 minutes) const
 {
   if (minutes <= 0)
     return FEE_MINIMUM;
-  int hours = static_cast<int>((minutes + 59) / 60);   // 1時間未満は切り上げ
+  int hours = static_cast<int>((minutes + 59) / 60);   // round any partial hour up
   return std::max(hours * FEE_PER_HOUR, FEE_MINIMUM);
 }
 
@@ -380,16 +463,16 @@ void licensePlateDialog::OK2Pay()
   const QString plate = ui->m_txtResult->toPlainText().trimmed().toUpper();
   if (plate.isEmpty())
     {
-      QMessageBox::warning(this, QStringLiteral("入力エラー"),
-                           QStringLiteral("ナンバーが空です。"));
+      QMessageBox::warning(this, QStringLiteral("Input error"),
+                           QStringLiteral("Plate number is empty."));
       return;
     }
 
   QSqlDatabase db = QSqlDatabase::database();
   if (!db.isOpen())
     {
-      QMessageBox::critical(this, QStringLiteral("DBエラー"),
-                            QStringLiteral("データベースを開けません。"));
+      QMessageBox::critical(this, QStringLiteral("Database error"),
+                            QStringLiteral("Failed to open the database."));
       return;
     }
 
@@ -398,7 +481,7 @@ void licensePlateDialog::OK2Pay()
 
   if (_mode == Mode::Entry)
     {
-      // 入場: 次の id を求めてレコードを追加
+      // Entry: insert a row using MAX(id)+1
       QSqlQuery idq("SELECT IFNULL(MAX(id), 0) + 1 FROM license");
       int nextId = 1;
       if (idq.next())
@@ -412,32 +495,32 @@ void licensePlateDialog::OK2Pay()
       query.bindValue(":dateandtime", nowStr);
       if (!query.exec())
         {
-          QMessageBox::critical(this, QStringLiteral("DBエラー"), query.lastError().text());
+          QMessageBox::critical(this, QStringLiteral("Database error"), query.lastError().text());
           return;
         }
-      _infoLabel->setText(QStringLiteral("✅ 入場を記録しました\nナンバー: %1\n入場時刻: %2")
+      _infoLabel->setText(QStringLiteral("Entry recorded\nPlate: %1\nEntry time: %2")
                           .arg(plate, now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))));
     }
-  else // 出場
+  else // Exit
     {
       const QString entryStr = findLatestEntryTime(plate);
       if (entryStr.isEmpty())
         {
-          QMessageBox::warning(this, QStringLiteral("記録なし"),
-              QStringLiteral("ナンバー %1 の入場記録が見つかりません。").arg(plate));
+          QMessageBox::warning(this, QStringLiteral("No record"),
+              QStringLiteral("No entry record found for plate %1.").arg(plate));
           return;
         }
       const QDateTime entryTime = QDateTime::fromString(entryStr, Qt::ISODate);
       const qint64 minutes = entryTime.secsTo(now) / 60;
       const int fee = calcFee(minutes);
 
-      // 精算済みのレコードを削除
+      // Remove the settled record
       QSqlQuery del;
       del.prepare("DELETE FROM license WHERE licenseNum = :p");
       del.bindValue(":p", plate);
       del.exec();
 
-      _infoLabel->setText(QStringLiteral("💰 出場\nナンバー: %1\n入場: %2\n出場: %3\n駐車時間: %4 分\n料金: %5 元")
+      _infoLabel->setText(QStringLiteral("Exit\nPlate: %1\nEntry: %2\nExit: %3\nDuration: %4 min\nFee: %5")
                           .arg(plate,
                                entryTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
                                now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
@@ -445,7 +528,7 @@ void licensePlateDialog::OK2Pay()
                                QString::number(fee)));
     }
 
-  // 次の車のために入力をクリアし、カメラ画面へ戻す
+  // Reset the input and go back to the camera page for the next vehicle
   _resultStr.clear();
   ui->m_txtResult->clear();
   ui->stackedWidget->setCurrentIndex(cameraPage);
